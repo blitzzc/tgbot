@@ -1,0 +1,6 @@
+{
+  "name": "Учебный хакатон",
+  "max_team_size": 4,
+  "timezone": "Asia/Almaty",
+  "database": "data/bot.db"
+}
