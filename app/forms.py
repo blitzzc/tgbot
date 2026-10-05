@@ -5,9 +5,9 @@ def field(key, title, kind="text", options=None, required=True, maximum=600):
     return {"key": key, "title": title, "kind": kind, "options": options, "required": required, "maximum": maximum}
 
 
-def fields(kind, config):
+def fields(kind, config, legacy=False):
     if kind == "profile":
-        return [
+        original = [
             field("name", "Имя или псевдоним", maximum=60),
             field("role", "Основная роль", "choice", ROLES),
             field("extra_roles", "Дополнительные роли (можно пропустить)", "multi", ROLES, False),
@@ -17,10 +17,13 @@ def fields(kind, config):
             field("projects", "Проекты (необязательно)", required=False),
             field("links", "До трёх ссылок с https:// (необязательно)", required=False, maximum=500),
         ]
+        if legacy:
+            return original
+        return [original[i] for i in (1, 3, 4, 5, 0, 2, 6, 7)]
     if kind == "team":
         return [
             field("name", "Название команды", maximum=80),
-            field("idea", "Тема (можно пропустить: «Тему выберем вместе»)", required=False),
+            field("idea", "Тема — рекомендуем указать, чтобы участникам было проще выбрать команду", required=False),
         ]
     if kind == "vacancy":
         return [

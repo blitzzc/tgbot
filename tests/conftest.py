@@ -1,7 +1,20 @@
 import pytest
+import time
 
 from app.config import Config
 from app.services.core import Service
+
+
+@pytest.fixture(autouse=True)
+def elapsed_offer_time(monkeypatch):
+    # Старые сценарии отправляют несколько предложений без реального ожидания.
+    # Моделируем прошедшее время; новые тесты лимитов задают часы явно.
+    current = time.time()
+    def tick():
+        nonlocal current
+        current += 3.01
+        return current
+    monkeypatch.setattr("app.services.core.offer_time", tick)
 
 
 def person(name="Участник", **changes):

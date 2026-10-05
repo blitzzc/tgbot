@@ -2,6 +2,12 @@ CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY,
     chat_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fsm_sessions (
+    key TEXT PRIMARY KEY,
+    state TEXT,
+    data TEXT NOT NULL DEFAULT '{}',
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS profiles (
     user_id INTEGER PRIMARY KEY REFERENCES users(id),
     data TEXT NOT NULL,
@@ -29,14 +35,16 @@ CREATE TABLE IF NOT EXISTS memberships (
     team_id INTEGER NOT NULL REFERENCES teams(id),
     role TEXT NOT NULL,
     shared_contact TEXT,
-    joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    generation TEXT NOT NULL DEFAULT (lower(hex(randomblob(8))))
 );
 CREATE TABLE IF NOT EXISTS vacancies (
     id INTEGER PRIMARY KEY,
     team_id INTEGER NOT NULL REFERENCES teams(id),
     data TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','filled','closed')),
-    filled_by INTEGER REFERENCES users(id)
+    filled_by INTEGER REFERENCES users(id),
+    version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS vacancy_skills (
     vacancy_id INTEGER NOT NULL REFERENCES vacancies(id),
@@ -55,7 +63,8 @@ CREATE TABLE IF NOT EXISTS offers (
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','rejected','cancelled','outdated')),
     reason TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    resolved_at TEXT
+    resolved_at TEXT,
+    sent_at REAL NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_pending_offer
     ON offers(user_id, vacancy_id) WHERE status='pending';
@@ -68,5 +77,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     body TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','sent','failed')),
     attempts INTEGER NOT NULL DEFAULT 0,
-    next_attempt REAL NOT NULL DEFAULT 0
+    next_attempt REAL NOT NULL DEFAULT 0,
+    sending_at REAL,
+    claim_token TEXT,
+    uncertain INTEGER NOT NULL DEFAULT 0,
+    subjects TEXT NOT NULL DEFAULT '[]'
 );

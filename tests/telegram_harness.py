@@ -15,6 +15,7 @@ class RecordingSession(BaseSession):
         super().__init__()
         self.sent = []
         self.answers = []
+        self.requests = []
 
     async def close(self):
         pass
@@ -25,6 +26,7 @@ class RecordingSession(BaseSession):
             return True
         if not isinstance(method, SendMessage):
             raise AssertionError(f"Unexpected Telegram method: {type(method).__name__}")
+        self.requests.append(method)
         message = Message(
             message_id=len(self.sent) + 1,
             date=datetime.now(timezone.utc),
@@ -92,15 +94,15 @@ async def fill_profile(harness, actor, name):
     await harness.send(actor, "/start")
     await harness.send(actor, "Моя анкета")
     await harness.click(actor, "Заполнить анкету")
-    await harness.send(actor, name)
     await harness.click(actor, "Бэкенд-разработчик")
-    await harness.click(actor, "Пропустить")
     await harness.click(actor, "Python")
     await harness.click(actor, "PostgreSQL")
     await harness.click(actor, "Готово")
     await harness.send(actor, "Учусь, хочу сделать рабочий API")
     await harness.click(actor, "Новичок")
-    for _ in range(2):
+    await harness.click(actor, "Дополнить анкету")
+    await harness.send(actor, name)
+    for _ in range(3):
         await harness.click(actor, "Пропустить")
     assert "Предпросмотр" in harness.last(actor).text
     await harness.click(actor, "Сохранить")
@@ -111,6 +113,7 @@ async def create_team_and_place(harness, captain):
     await harness.click(captain, "Создать команду")
     await harness.send(captain, "[ТЕСТ] Команда прототипа")
     await harness.click(captain, "Пропустить")
+    await harness.click(captain, "Да, пропустить")
     await harness.click(captain, "Сохранить")
     await harness.click(captain, "Добавить место")
     await harness.click(captain, "Бэкенд-разработчик")

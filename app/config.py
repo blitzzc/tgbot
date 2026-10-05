@@ -10,6 +10,7 @@ class Config:
     max_team_size: int = 4
     timezone: str = "Asia/Almaty"
     database: str = "data/bot.db"
+    max_offers_per_day: int = 10
 
     def __post_init__(self):
         if not self.name.strip() or len(self.name) > 100:
@@ -18,6 +19,8 @@ class Config:
             raise ValueError("Максимальный размер команды: целое число от 2 до 20.")
         if not isinstance(self.database, str) or not self.database.strip():
             raise ValueError("Не указан путь базы данных.")
+        if type(self.max_offers_per_day) is not int or not 1 <= self.max_offers_per_day <= 100:
+            raise ValueError("Лимит предложений за сутки: целое число от 1 до 100.")
         try:
             ZoneInfo(self.timezone)
         except ZoneInfoNotFoundError:

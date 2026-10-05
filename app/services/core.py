@@ -1,11 +1,13 @@
 import json
 import time
+import secrets
 from urllib.parse import urlparse
 
 from app.catalogs import (
     COMMON_SKILLS, EXPERIENCE, ROLES, normalize_skill,
 )
 from app.db import Database
+from app.cards import offer_reason
 
 
 class DomainError(Exception):
@@ -16,14 +18,34 @@ def dump(data):
     return json.dumps(data, ensure_ascii=False)
 
 
+def offer_time():
+    return time.time()
+
+
 class Service:
     def __init__(self, config):
         self.config = config
         self.db = Database(config.database)
+        self.offer_clock = offer_time
 
     def register(self, user_id, chat_id):
         with self.db.connect(write=True) as c:
             c.execute("INSERT INTO users(id,chat_id) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET chat_id=excluded.chat_id", (user_id, chat_id))
+
+    def menu_labels(self, actor):
+        with self.db.connect() as c:
+            profile = c.execute("SELECT 1 FROM profiles WHERE user_id=?", (actor,)).fetchone()
+            member = self._membership(c, actor)
+            labels = ["Моя анкета"] if profile else ["Заполнить анкету"]
+            if member:
+                labels.append("Моя команда")
+                if self._team(c, member["team_id"])["captain_id"] == actor:
+                    labels.append("Места и заявки")
+            elif profile:
+                labels.extend(["Найти команду", "Подходящие команды", "Создать команду", "Команды"])
+            if profile:
+                labels.append("Заявки и приглашения")
+            return labels + ["Мои данные", "Настройки и помощь"]
 
     @staticmethod
     def _text(data, key, maximum, required=True):
@@ -135,7 +157,7 @@ class Service:
         row = c.execute("SELECT * FROM vacancies WHERE id=?", (vacancy_id,)).fetchone()
         if not row:
             raise DomainError("Место не найдено.")
-        return dict(json.loads(row["data"]), id=row["id"], team_id=row["team_id"], status=row["status"], filled_by=row["filled_by"])
+        return dict(json.loads(row["data"]), id=row["id"], team_id=row["team_id"], status=row["status"], filled_by=row["filled_by"], version=row["version"])
 
     def vacancy(self, vacancy_id):
         with self.db.connect() as c:
@@ -150,8 +172,8 @@ class Service:
         return team
 
     @staticmethod
-    def _notify(c, user_id, body):
-        c.execute("INSERT INTO notifications(user_id,body) VALUES(?,?)", (user_id, body))
+    def _notify(c, user_id, body, subjects=()):
+        c.execute("INSERT INTO notifications(user_id,body,subjects) VALUES(?,?,?)", (user_id, body, dump(list(subjects))))
 
     @classmethod
     def _finish_pending(cls, c, where, params, reason):
@@ -162,7 +184,7 @@ class Service:
         for row in rows:
             c.execute("UPDATE offers SET status='outdated',reason=?,resolved_at=CURRENT_TIMESTAMP WHERE id=? AND status='pending'", (reason, row["id"]))
             for recipient in {row["user_id"], row["captain_id"]}:
-                cls._notify(c, recipient, f"Предложение №{row['id']} стало неактуальным: {reason}")
+                cls._notify(c, recipient, f"Предложение №{row['id']} стало неактуальным: {offer_reason(reason)}", (row["user_id"], row["sender_id"]))
 
     @staticmethod
     def _save_skills(c, values):
@@ -211,7 +233,7 @@ class Service:
             if self._membership(c, actor):
                 raise DomainError("Вы уже в команде. Сначала выйдите или передайте управление.")
             team_id = c.execute("INSERT INTO teams(captain_id,data) VALUES(?,?)", (actor, dump(data))).lastrowid
-            c.execute("INSERT INTO memberships(user_id,team_id,role) VALUES(?,?,?)", (actor, team_id, profile["role"]))
+            c.execute("INSERT INTO memberships(user_id,team_id,role,generation) VALUES(?,?,?,?)", (actor, team_id, profile["role"], secrets.token_hex(8)))
             self._finish_pending(c, "o.user_id=?", (actor,), "Участник создал собственную команду.")
             return team_id
 
@@ -227,7 +249,7 @@ class Service:
             if team["status"] == "disbanded":
                 raise DomainError("Команда расформирована.")
             rows = c.execute("SELECT * FROM memberships WHERE team_id=? ORDER BY joined_at,user_id", (team_id,)).fetchall()
-            team["members"] = [dict(self._profile(c, row["user_id"]), team_role=row["role"]) for row in rows]
+            team["members"] = [dict(self._profile(c, row["user_id"]), team_role=row["role"], generation=row["generation"]) for row in rows]
             rows = c.execute("SELECT id FROM vacancies WHERE team_id=? ORDER BY id", (team_id,)).fetchall()
             team["vacancies"] = [self._vacancy(c, row["id"]) for row in rows]
             return team
@@ -262,7 +284,7 @@ class Service:
             old_data = {key: place[key] for key in data}
             if old_data == data:
                 return
-            c.execute("UPDATE vacancies SET data=? WHERE id=?", (dump(data), place_id))
+            c.execute("UPDATE vacancies SET data=?,version=version+1 WHERE id=?", (dump(data), place_id))
             self._write_vacancy_skills(c, place_id, data)
             self._finish_pending(c, "o.vacancy_id=?", (place_id,), "Капитан изменил описание или требования места.")
 
@@ -272,15 +294,36 @@ class Service:
             self._captain(c, actor, place["team_id"])
             if place["status"] != "open":
                 raise DomainError("Это место уже закрыто или заполнено.")
-            c.execute("UPDATE vacancies SET status='closed' WHERE id=?", (place_id,))
+            c.execute("UPDATE vacancies SET status='closed',version=version+1 WHERE id=?", (place_id,))
             self._finish_pending(c, "o.vacancy_id=?", (place_id,), "Капитан закрыл место.")
+
+    def reuse_vacancy(self, actor, place_id, version, copy=False):
+        with self.db.connect(write=True) as c:
+            place = self._vacancy(c, place_id)
+            team = self._captain(c, actor, place["team_id"])
+            if place["version"] != version or place["status"] not in {"filled", "closed"}:
+                raise DomainError("Место изменилось. Откройте его заново.")
+            if team["status"] != "open":
+                raise DomainError("Сначала возобновите набор команды.")
+            occupied = c.execute("SELECT COUNT(*) FROM memberships WHERE team_id=?", (team["id"],)).fetchone()[0]
+            opened = c.execute("SELECT COUNT(*) FROM vacancies WHERE team_id=? AND status='open'", (team["id"],)).fetchone()[0]
+            if occupied + opened >= self.config.max_team_size:
+                raise DomainError("Лимит участников и открытых мест достигнут. Закройте лишнее место.")
+            c.execute("UPDATE vacancies SET version=version+1 WHERE id=?", (place_id,))
+            if copy:
+                data = self.validate_vacancy(place)
+                new_id = c.execute("INSERT INTO vacancies(team_id,data) VALUES(?,?)", (team["id"], dump(data))).lastrowid
+                self._write_vacancy_skills(c, new_id, data)
+                return new_id
+            c.execute("UPDATE vacancies SET status='open',filled_by=NULL WHERE id=?", (place_id,))
+            return place_id
 
     def set_recruitment(self, actor, team_id, opened):
         with self.db.connect(write=True) as c:
             self._captain(c, actor, team_id)
             c.execute("UPDATE teams SET status=? WHERE id=?", ("open" if opened else "paused", team_id))
             if not opened:
-                self._finish_pending(c, "t.id=?", (team_id,), "Набор команды приостановлен.")
+                self._finish_pending(c, "t.id=?", (team_id,), "Набор был приостановлен.")
 
     @staticmethod
     def incompatibilities(profile, place, team):
@@ -427,9 +470,15 @@ class Service:
             existing = c.execute("SELECT id FROM offers WHERE user_id=? AND vacancy_id IS ? AND team_id=? AND status='pending'", (user_id, place_id, team["id"])).fetchone()
             if existing:
                 raise DomainError(f"Уже есть активное предложение №{existing['id']}. Откройте «Заявки и приглашения».")
-            offer_id = c.execute("INSERT INTO offers(kind,user_id,team_id,vacancy_id,sender_id,message) VALUES(?,?,?,?,?,?)", (kind, user_id, team["id"], place_id, actor, message)).lastrowid
+            now = self.offer_clock()
+            quota = c.execute("SELECT COUNT(*),MAX(sent_at) FROM offers WHERE sender_id=? AND sent_at>?", (actor, now - 86400)).fetchone()
+            if quota[0] >= self.config.max_offers_per_day:
+                raise DomainError(f"Лимит: не более {self.config.max_offers_per_day} предложений за 24 часа. Попробуйте позже.")
+            if quota[1] is not None and now - quota[1] < 3:
+                raise DomainError("Подождите три секунды между отправками новых предложений.")
+            offer_id = c.execute("INSERT INTO offers(kind,user_id,team_id,vacancy_id,sender_id,message,sent_at) VALUES(?,?,?,?,?,?,?)", (kind, user_id, team["id"], place_id, actor, message, now)).lastrowid
             recipient = team["captain_id"] if kind == "application" else user_id
-            self._notify(c, recipient, f"Новое предложение №{offer_id}. Откройте «Заявки и приглашения», чтобы посмотреть команду, анкету и сообщение.")
+            self._notify(c, recipient, f"Новое предложение №{offer_id}. Откройте «Заявки и приглашения», чтобы посмотреть команду, анкету и сообщение.", (user_id, actor))
             return offer_id
 
     @classmethod
@@ -491,9 +540,9 @@ class Service:
                 if place and self.incompatibilities(profile, place, team):
                     raise DomainError("Анкета больше не соответствует обязательным требованиям места.")
                 role = place["role"] if place else profile["role"]
-                c.execute("INSERT INTO memberships(user_id,team_id,role) VALUES(?,?,?)", (offer["user_id"], team["id"], role))
+                c.execute("INSERT INTO memberships(user_id,team_id,role,generation) VALUES(?,?,?,?)", (offer["user_id"], team["id"], role, secrets.token_hex(8)))
                 if place:
-                    c.execute("UPDATE vacancies SET status='filled',filled_by=? WHERE id=? AND status='open'", (offer["user_id"], place["id"]))
+                    c.execute("UPDATE vacancies SET status='filled',filled_by=?,version=version+1 WHERE id=? AND status='open'", (offer["user_id"], place["id"]))
                 status = "accepted"
             else:
                 status = "cancelled" if action == "cancel" else "rejected"
@@ -502,11 +551,22 @@ class Service:
                 self._finish_pending(c, "(o.user_id=? OR o.vacancy_id=?)", (offer["user_id"], place["id"] if place else None), "Участник вступил в команду или место занято.")
                 if count + 1 >= self.config.max_team_size:
                     self._finish_pending(c, "t.id=?", (team["id"],), "Команда заполнена.")
-                    c.execute("UPDATE vacancies SET status='closed' WHERE team_id=? AND status='open'", (team["id"],))
+                    c.execute("UPDATE vacancies SET status='closed',version=version+1 WHERE team_id=? AND status='open'", (team["id"],))
             labels = {"accepted": "принято — состав обновлён", "rejected": "отклонено", "cancelled": "отменено"}
             for person in {offer["user_id"], team["captain_id"]}:
-                self._notify(c, person, f"Предложение №{offer_id} {labels[status]}." + (" Контакт можно добровольно передать через «Моя команда»." if status == "accepted" else ""))
+                self._notify(c, person, f"Предложение №{offer_id} {labels[status]}." + (" Контакт можно добровольно передать через «Моя команда»." if status == "accepted" else ""), (offer["user_id"], offer["sender_id"]))
             return status
+
+    def exclude_member(self, actor, team_id, user_id, generation):
+        with self.db.connect(write=True) as c:
+            self._captain(c, actor, team_id)
+            if user_id == actor:
+                raise DomainError("Нельзя исключить себя. Передайте управление или расформируйте команду.")
+            member = self._membership(c, user_id)
+            if not member or member["team_id"] != team_id or member["generation"] != generation:
+                raise DomainError("Состав изменился. Откройте состав заново.")
+            c.execute("DELETE FROM memberships WHERE user_id=?", (user_id,))
+            self._notify(c, user_id, "Капитан исключил вас из команды. Можно снова искать команду и подавать заявки.")
 
     def leave_team(self, actor, team_id):
         with self.db.connect(write=True) as c:
@@ -518,7 +578,7 @@ class Service:
                 raise DomainError("Сначала передайте управление участнику или расформируйте команду.")
             name = self._profile(c, actor)["name"]
             c.execute("DELETE FROM memberships WHERE user_id=?", (actor,))
-            self._notify(c, team["captain_id"], f"{name} вышел(а) из команды. Старое место не открыто: при необходимости создайте новое.")
+            self._notify(c, team["captain_id"], f"{name} вышел(а) из команды. Старое место не открыто: капитан может открыть его снова или создать копию.", (actor,))
             self._notify(c, actor, "Вы вышли из команды. Теперь можно искать другую или создать свою.")
 
     def transfer_captain(self, actor, team_id, new_captain):
@@ -529,7 +589,7 @@ class Service:
                 raise DomainError("Выберите другого действующего участника команды.")
             c.execute("UPDATE teams SET captain_id=? WHERE id=?", (new_captain, team_id))
             for row in c.execute("SELECT user_id FROM memberships WHERE team_id=?", (team_id,)).fetchall():
-                self._notify(c, row["user_id"], "Управление командой передано участнику: " + self._profile(c, new_captain)["name"])
+                self._notify(c, row["user_id"], "Управление командой передано участнику: " + self._profile(c, new_captain)["name"], (new_captain,))
 
     def change_role(self, actor, team_id, user_id, role):
         if role not in ROLES:
@@ -548,7 +608,7 @@ class Service:
             for row in c.execute("SELECT user_id FROM memberships WHERE team_id=?", (team_id,)).fetchall():
                 self._notify(c, row["user_id"], "Капитан расформировал команду. Теперь можно искать другую или создать свою.")
             self._finish_pending(c, "t.id=?", (team_id,), "Команда расформирована.")
-            c.execute("UPDATE vacancies SET status='closed' WHERE team_id=? AND status='open'", (team_id,))
+            c.execute("UPDATE vacancies SET status='closed',version=version+1 WHERE team_id=? AND status='open'", (team_id,))
             c.execute("DELETE FROM memberships WHERE team_id=?", (team_id,))
             c.execute("UPDATE teams SET status='disbanded' WHERE id=?", (team_id,))
 
@@ -566,18 +626,82 @@ class Service:
             c.execute("UPDATE memberships SET shared_contact=? WHERE user_id=?", (contact, actor))
             name = self._profile(c, actor)["name"]
             for recipient in recipients:
-                self._notify(c, recipient, f"{name} добровольно поделился(ась) контактом с командой:\n{contact}")
+                self._notify(c, recipient, f"{name} добровольно поделился(ась) контактом с командой:\n{contact}", (actor,))
+
+    @classmethod
+    def _check_deletion(cls, c, actor):
+        member = cls._membership(c, actor)
+        if member and cls._team(c, member["team_id"])["captain_id"] == actor:
+            raise DomainError("Сначала передайте управление или расформируйте команду, затем удалите данные.")
+
+    def check_deletion(self, actor):
+        with self.db.connect() as c:
+            self._check_deletion(c, actor)
+
+    def delete_data(self, actor):
+        with self.db.connect(write=True) as c:
+            self._check_deletion(c, actor)
+            row = c.execute("SELECT data FROM profiles WHERE user_id=?", (actor,)).fetchone()
+            member = self._membership(c, actor)
+            personal = [json.loads(row[0])["name"]] if row else []
+            if member and member["shared_contact"]:
+                personal.append(member["shared_contact"])
+            offers = [r[0] for r in c.execute("SELECT id FROM offers WHERE user_id=? OR sender_id=?", (actor, actor))]
+            for notice in c.execute("SELECT id,user_id,subjects,body FROM notifications").fetchall():
+                related = actor in json.loads(notice["subjects"])
+                # Старые уведомления ещё не имели метаданных о владельце контакта.
+                legacy = notice["subjects"] == "[]" and (any(value in notice["body"] for value in personal) or any(f"№{i} " in notice["body"] or f"№{i}." in notice["body"] for i in offers))
+                if notice["user_id"] == actor or related or legacy:
+                    c.execute("DELETE FROM notifications WHERE id=?", (notice["id"],))
+            c.execute("DELETE FROM offers WHERE user_id=? OR sender_id=?", (actor, actor))
+            c.execute("DELETE FROM memberships WHERE user_id=?", (actor,))
+            c.execute("DELETE FROM profiles WHERE user_id=?", (actor,))
+            c.execute("UPDATE vacancies SET filled_by=NULL WHERE filled_by=?", (actor,))
+            # У расформированной команды сохраняется техническая история без ID бывшего капитана.
+            if c.execute("SELECT 1 FROM teams WHERE captain_id=?", (actor,)).fetchone():
+                c.execute("INSERT OR IGNORE INTO users(id,chat_id) VALUES(0,0)")
+                c.execute("UPDATE teams SET captain_id=0 WHERE captain_id=?", (actor,))
+            for session in c.execute("SELECT key,data FROM fsm_sessions").fetchall():
+                def references(value):
+                    if isinstance(value, dict):
+                        return value.get("user_id") == actor or actor in value.get("recipients", []) or any(references(v) for v in value.values())
+                    return isinstance(value, list) and any(references(v) for v in value)
+                if json.loads(session["key"])["user_id"] == actor or references(json.loads(session["data"])):
+                    c.execute("DELETE FROM fsm_sessions WHERE key=?", (session["key"],))
+            c.execute("DELETE FROM skills WHERE id NOT IN (SELECT skill_id FROM profile_skills) AND id NOT IN (SELECT skill_id FROM vacancy_skills)")
+            c.execute("DELETE FROM users WHERE id=?", (actor,))
+            if member:
+                captain = self._team(c, member["team_id"])["captain_id"]
+                self._notify(c, captain, "Участник удалил свои данные и вышел из команды. Состав обновлён.")
 
     def pending_notifications(self):
         with self.db.connect() as c:
-            return [dict(row) for row in c.execute("SELECT n.*,u.chat_id FROM notifications n JOIN users u ON u.id=n.user_id WHERE status='pending' AND next_attempt<=? ORDER BY id LIMIT 20", (time.time(),))]
+            now = time.time()
+            return [dict(row) for row in c.execute("SELECT n.*,u.chat_id FROM notifications n JOIN users u ON u.id=n.user_id WHERE status='pending' AND next_attempt<=? AND (sending_at IS NULL OR sending_at<=?) ORDER BY id LIMIT 20", (now, now - 60))]
 
-    def notification_result(self, notification_id, success, permanent=False, retry_after=None):
+    def claim_notification(self, notification_id):
         with self.db.connect(write=True) as c:
-            row = c.execute("SELECT attempts FROM notifications WHERE id=?", (notification_id,)).fetchone()
-            if not row:
+            row = c.execute("SELECT n.*,u.chat_id FROM notifications n JOIN users u ON u.id=n.user_id WHERE n.id=?", (notification_id,)).fetchone()
+            now = time.time()
+            if not row or row["status"] != "pending" or row["next_attempt"] > now or (row["sending_at"] is not None and row["sending_at"] > now - 60):
+                return None
+            if row["attempts"] >= 5:
+                c.execute("UPDATE notifications SET status='failed',sending_at=NULL,claim_token=NULL WHERE id=?", (notification_id,))
+                return None
+            uncertain = bool(row["uncertain"] or row["sending_at"] is not None)
+            token = secrets.token_hex(8)
+            c.execute("UPDATE notifications SET sending_at=?,claim_token=?,attempts=attempts+1,uncertain=? WHERE id=?", (now, token, int(uncertain), notification_id))
+            result = dict(row, claim_token=token)
+            if uncertain:
+                result["body"] = "Повторное уведомление: результат предыдущей доставки неизвестен.\n\n" + row["body"]
+            return result
+
+    def notification_result(self, notification_id, success, permanent=False, retry_after=None, claim_token=None):
+        with self.db.connect(write=True) as c:
+            row = c.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+            if not row or row["status"] != "pending" or row["claim_token"] != claim_token:
                 return
-            attempts = row["attempts"] + 1
+            attempts = row["attempts"] if claim_token else row["attempts"] + 1
             status = "sent" if success else ("failed" if permanent or attempts >= 5 else "pending")
             delay = retry_after if retry_after is not None else min(300, 2 ** attempts)
-            c.execute("UPDATE notifications SET status=?,attempts=?,next_attempt=? WHERE id=?", (status, attempts, time.time() + delay, notification_id))
+            c.execute("UPDATE notifications SET status=?,attempts=?,next_attempt=?,sending_at=NULL,claim_token=NULL,uncertain=? WHERE id=?", (status, attempts, time.time() + delay, int(row["uncertain"] or (not success and not permanent and retry_after is None)), notification_id))

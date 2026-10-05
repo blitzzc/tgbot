@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -7,10 +8,45 @@ class Database:
     def __init__(self, path):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as source:
+            tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if tables and "fsm_sessions" not in tables:
+                self.backup(source, "before-fsm")
         with self.connect() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
             connection.executescript(Path(__file__).with_name("schema.sql").read_text(encoding="utf-8"))
         self._migrate_offers()
+        self.add_column("memberships", "generation", "TEXT NOT NULL DEFAULT ''", "before-member-generation")
+        self.add_column("vacancies", "version", "INTEGER NOT NULL DEFAULT 0", "before-vacancy-version")
+        self.add_column("notifications", "sending_at", "REAL", "before-notification-lease")
+        self.add_column("notifications", "claim_token", "TEXT", "before-notification-lease")
+        self.add_column("notifications", "uncertain", "INTEGER NOT NULL DEFAULT 0", "before-notification-lease")
+        self.add_column("notifications", "subjects", "TEXT NOT NULL DEFAULT '[]'", "before-data-deletion")
+        self.add_column("offers", "sent_at", "REAL NOT NULL DEFAULT 0", "before-offer-limits")
+        with self.connect(write=True) as c:
+            c.execute("CREATE INDEX IF NOT EXISTS offers_sender_time ON offers(sender_id,sent_at)")
+            c.execute("UPDATE offers SET sent_at=CAST(strftime('%s',created_at) AS REAL) WHERE sent_at=0")
+            c.execute("UPDATE memberships SET generation=lower(hex(randomblob(8))) WHERE generation=''")
+            c.execute("DELETE FROM fsm_sessions WHERE updated_at < ?", (time.time() - 7 * 86400,))
+
+    def add_column(self, table, column, definition, label):
+        # Имена и определения задаются только исходным кодом, не пользовательским вводом.
+        with self.connect() as c:
+            if column in {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}:
+                return
+            self.backup(c, label)
+        with self.connect(write=True) as c:
+            if column not in {row["name"] for row in c.execute(f"PRAGMA table_info({table})")}:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    def backup(self, source, label):
+        backup_path = Path(self.path + "." + label + ".bak")
+        if not backup_path.exists():
+            destination = sqlite3.connect(backup_path)
+            try:
+                source.backup(destination)
+            finally:
+                destination.close()
 
     def _migrate_offers(self):
         with self.connect() as source:

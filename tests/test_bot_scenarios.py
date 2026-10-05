@@ -113,7 +113,7 @@ def test_cancel_edit_custom_skills_and_expired_form_buttons(service):
             await h.click(202, "Изменить анкету")
             old_message = h.last(202)
             old_button = old_message.reply_markup.inline_keyboard[0][0].callback_data
-            await h.send(202, "Новое имя")
+            await h.click(202, "Оставить текущее")
             await h.callback(202, old_button, old_message)
             assert "устарела" in h.last(202).text
             await h.send(202, "/cancel")
@@ -125,8 +125,6 @@ def test_cancel_edit_custom_skills_and_expired_form_buttons(service):
             assert service.profile(202)["visible"]
             await h.click(202, "Изменить анкету")
             await h.click(202, "Оставить текущее")
-            await h.click(202, "Оставить текущее")
-            await h.click(202, "Пропустить")
             await h.click(202, "Добавить свой навык")
             await h.send(202, "Мой   Навык")
             assert "Мой   Навык" in [b.text.removeprefix("✓ ") for row in h.last(202).reply_markup.inline_keyboard for b in row]
@@ -172,15 +170,16 @@ def test_bad_links_can_be_corrected_before_save(service):
         try:
             await fill_profile(h, 202, "Исходная анкета")
             await h.click(202, "Изменить анкету")
-            for _ in range(2):
-                await h.click(202, "Оставить текущее")
-            await h.click(202, "Пропустить")
+            await h.click(202, "Оставить текущее")
             await h.click(202, "Готово")
             for _ in range(2):
                 await h.click(202, "Оставить текущее")
+            await h.click(202, "Дополнить анкету")
+            await h.click(202, "Оставить текущее")
+            await h.click(202, "Пропустить")
             await h.click(202, "Пропустить")
             await h.send(202, "javascript:bad")
-            assert "Шаг 1/8" in h.last(202).text
+            assert "Шаг 1/4" in h.last(202).text
             assert service.profile(202)["links"] == ""
             await h.click(202, "Отменить заполнение")
         finally:

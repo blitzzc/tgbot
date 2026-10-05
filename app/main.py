@@ -23,7 +23,7 @@ async def run():
         print("Ошибка конфигурации. Проверьте config.json или config.example.json.")
         return
     try:
-        service = Service(config)
+        service = await asyncio.to_thread(Service, config)
     except Exception:
         print("Не удалось открыть базу данных. Проверьте путь database и доступ к папке.")
         return

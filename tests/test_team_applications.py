@@ -189,6 +189,7 @@ async def general_application_flow(service):
         await h.click(101, "Создать команду")
         await h.send(101, "[ТЕСТ] Команда без позиций")
         await h.click(101, "Пропустить")
+        await h.click(101, "Да, пропустить")
         await h.click(101, "Сохранить")
         team_id = service.membership(101)["team_id"]
         assert service.team(team_id)["vacancies"] == []

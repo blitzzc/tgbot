@@ -1,5 +1,12 @@
 from app.catalogs import EXPERIENCE, ROLES
 
+
+def offer_reason(reason):
+    text = reason or ""
+    if "приостанов" in text.lower() or "закрыл место" in text.lower():
+        text += " После возобновления набора и открытия места можно подать новую заявку. Старое предложение не восстановится."
+    return text
+
 OFFER_STATUS = {"pending": "Ожидает решения", "accepted": "Принято", "rejected": "Отклонено", "cancelled": "Отменено", "outdated": "Неактуально"}
 PLACE_STATUS = {"open": "Открыто", "filled": "Заполнено", "closed": "Закрыто капитаном"}
 TEAM_STATUS = {"open": "Набор открыт", "paused": "Набор приостановлен", "disbanded": "Расформирована"}
